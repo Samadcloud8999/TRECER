@@ -29,6 +29,10 @@ import {
   ChevronRight,
   Search,
   Target,
+  Users,
+  MessageCircle,
+  UserRound,
+  Shield,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -58,6 +62,7 @@ import {
   dropMedia,
   backup,
   restore,
+  migrateLocal,
 } from "./store";
 import {
   requestNotifications,
@@ -73,6 +78,12 @@ import {
 import Orbit from "./Orbit";
 import Map from "./Map";
 import Weather from "./Weather";
+import { useAuth, InstallApp } from "./Auth";
+import { supabase, cloudConfigured, friendlyError } from "./cloud";
+import Friends from "./social/Friends";
+import Chats from "./social/Chats";
+import Account from "./social/Account";
+import MessageWatcher from "./social/MessageWatcher";
 const nav = [
   ["/", "Обзор", LayoutDashboard],
   ["/expenses", "Расходы", Receipt],
@@ -81,6 +92,9 @@ const nav = [
   ["/places", "Мои места", Heart],
   ["/events", "События", CalendarDays],
   ["/weather", "Погода", CloudSun],
+  ["/friends", "Друзья", Users],
+  ["/chats", "Чаты", MessageCircle],
+  ["/account", "Аккаунт", UserRound],
   ["/settings", "Настройки", Settings],
 ];
 const colors = [
@@ -97,12 +111,14 @@ function Photo({ id, className = "", alt = "Фото" }) {
   useEffect(() => {
     let active = true,
       created;
-    getMedia(id).then((blob) => {
-      if (blob && active) {
-        created = URL.createObjectURL(blob);
-        setUrl(created);
-      }
-    });
+    getMedia(id)
+      .then((blob) => {
+        if (blob && active) {
+          created = URL.createObjectURL(blob);
+          setUrl(created);
+        }
+      })
+      .catch(() => {});
     return () => {
       active = false;
       if (created) URL.revokeObjectURL(created);
@@ -443,6 +459,16 @@ function EntryForm({ initial, kind, onSave, onClose, notify }) {
               </label>
             </div>
           </details>
+          {kind === "place" && (
+            <label className="share-place">
+              <input
+                type="checkbox"
+                checked={!!d.shared}
+                onChange={(e) => set("shared", e.target.checked)}
+              />
+              <span>Показывать друзьям — фото и место на карте</span>
+            </label>
+          )}
           <p className="hint">
             Геопозиция относится к моменту записи. При загрузке старого фото
             укажи место вручную — координаты из фото не извлекаются.
@@ -714,6 +740,7 @@ function RecordList({ rows, onEdit, onDelete, onView, compact = false }) {
   );
 }
 export default function App() {
+  const { user, profile } = useAuth();
   const [state, setState] = useState();
   const [modal, setModal] = useState();
   const [toast, setToast] = useState("");
@@ -730,13 +757,14 @@ export default function App() {
   const location = useLocation();
   const latest = useRef();
   const saving = useRef(Promise.resolve());
+  const notified = useRef(new globalThis.Map());
   latest.current = state;
   useEffect(() => {
     readData()
       .then(setState)
       .catch(() =>
         setToast(
-          "Не удалось открыть память устройства. Попробуй обычный режим браузера.",
+          "Не удалось загрузить дневник. Проверь сеть и настройку базы Supabase.",
         ),
       );
   }, []);
@@ -752,6 +780,70 @@ export default function App() {
     const id = setTimeout(() => setToast(""), 5000);
     return () => clearTimeout(id);
   }, [toast]);
+  async function reloadCloud() {
+    if (modal) return;
+    const task = saving.current.then(async () => {
+      const next = await readData();
+      setState(next);
+      latest.current = next;
+      return next;
+    });
+    saving.current = task.catch(() => {});
+    return task;
+  }
+  function importLocal() {
+    const task = saving.current.then(async () => {
+      const next = await migrateLocal();
+      setState(next);
+      latest.current = next;
+      return next;
+    });
+    saving.current = task.catch(() => {});
+    return task;
+  }
+  function replaceData(payload) {
+    const task = saving.current.then(async () => {
+      const next = await restore(payload);
+      setState(next);
+      latest.current = next;
+      return next;
+    });
+    saving.current = task.catch(() => {});
+    return task;
+  }
+  useEffect(() => {
+    if (!user || !state) return;
+    let busy = false;
+    const load = async () => {
+      if (document.visibilityState !== "visible" || busy || modal) return;
+      busy = true;
+      try {
+        await reloadCloud();
+      } catch (e) {
+        setToast("Облачная синхронизация недоступна. Проверь интернет.");
+      } finally {
+        busy = false;
+      }
+    };
+    const timer = setInterval(load, 15000);
+    const c = supabase
+      .channel("diary-" + user.id)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "reminders",
+          filter: "owner_id=eq." + user.id,
+        },
+        load,
+      )
+      .subscribe();
+    return () => {
+      clearInterval(timer);
+      supabase.removeChannel(c);
+    };
+  }, [user, !!state, modal]);
   async function commit(next) {
     await saveData(next);
     setState(next);
@@ -780,6 +872,7 @@ export default function App() {
       }))
         .then(() => {
           for (const [r, o] of due) {
+            notified.current.set(r.id, Date.now());
             setAlert(r);
             if (audio) playSound(r.sound);
             if (!pushToken())
@@ -800,7 +893,8 @@ export default function App() {
     const handler = (e) => {
       if (e.data?.type === "reminder") {
         const r = latest.current?.reminders.find((x) => x.id === e.data.id);
-        if (r) {
+        if (r && Date.now() - (notified.current.get(r.id) || 0) > 120000) {
+          notified.current.set(r.id, Date.now());
           setAlert(r);
           if (audio) playSound(r.sound);
         }
@@ -901,6 +995,10 @@ export default function App() {
           ))}
         </nav>
         <div className="sidebar-bottom">
+          <NavLink to="/admin" className="admin-menu-link">
+            <Shield size={14} />
+            Управление
+          </NavLink>
           <div className="city-chip">
             <MapPin size={16} />
             <span>
@@ -908,10 +1006,12 @@ export default function App() {
             </span>
           </div>
           <div className="profile">
-            <span>С</span>
+            <span>{(profile?.display_name || "С")[0]}</span>
             <div>
-              <b>Мой дневник</b>
-              <small>Личное пространство</small>
+              <b>
+                {profile?.nickname ? "@" + profile.nickname : "Мой дневник"}
+              </b>
+              <small>{user ? "Облачный аккаунт" : "Локальный дневник"}</small>
             </div>
           </div>
         </div>
@@ -947,9 +1047,12 @@ export default function App() {
               <Bell size={20} />
               {state.reminders.some((r) => r.enabled) && <i />}
             </button>
-            <div className="avatar">С</div>
+            <NavLink to="/account" className="avatar">
+              {(profile?.display_name || "С")[0]}
+            </NavLink>
           </div>
         </header>
+        <MessageWatcher notify={notify} audio={audio} />
         <main>
           <AnimatePresence mode="wait">
             <motion.div
@@ -1356,7 +1459,15 @@ export default function App() {
                               </div>
                               <div className="event-copy">
                                 <h3>{r.title}</h3>
-                                <p>{r.body || "Без дополнительного текста"}</p>
+                                <p>
+                                  {r.body || "Без дополнительного текста"}
+                                  {r.fromFriend && (
+                                    <span className="friend-reminder-source">
+                                      {" "}
+                                      · От друга
+                                    </span>
+                                  )}
+                                </p>
                                 <span className="muted">
                                   {r.sound
                                     ? "Своя мелодия"
@@ -1446,12 +1557,25 @@ export default function App() {
                     </>
                   }
                 />
+                <Route path="/friends" element={<Friends notify={notify} />} />
+                <Route path="/chats" element={<Chats notify={notify} />} />
+                <Route
+                  path="/account"
+                  element={
+                    <Account
+                      notify={notify}
+                      reload={reloadCloud}
+                      onMigrate={importLocal}
+                    />
+                  }
+                />
                 <Route
                   path="/settings"
                   element={
                     <SettingsPage
                       state={state}
                       setState={setState}
+                      replaceData={replaceData}
                       mutate={mutate}
                       notify={notify}
                       enable={enable}
@@ -1865,6 +1989,7 @@ function GoalForm({ goal, onSave }) {
   );
 }
 function SettingsPage({
+  replaceData,
   state,
   setState,
   mutate,
@@ -1903,6 +2028,7 @@ function SettingsPage({
         title="Настройки"
         subtitle="Уведомления, звук и сохранность твоих записей."
       />
+      <InstallApp />
       <div className="settings-grid">
         <section className="card">
           <h2>Уведомления и звук</h2>
@@ -1956,7 +2082,7 @@ function SettingsPage({
               <p>
                 {push
                   ? "Подключены к серверу"
-                  : "Нужны ключи push, Redis и запуск планировщика"}
+                  : "Нужны ключи push, Supabase и запуск планировщика"}
               </p>
             </div>
             <button
@@ -2006,9 +2132,9 @@ function SettingsPage({
         <section className="card">
           <h2>Твои данные</h2>
           <p className="muted">
-            Записи, фото и аудио хранятся в этом браузере. Они не
-            синхронизируются между устройствами. Очистка данных сайта удалит их
-            — сохрани резервную копию.
+            {cloudConfigured
+              ? "После Google-входа записи, фото и мелодии хранятся в облачном аккаунте. Сохраняй резервную копию перед заменой данных."
+              : "Записи пока хранятся в этом браузере. После настройки облака их можно перенести в аккаунт. Сохраняй резервную копию."}
           </p>
           <div className="backup-actions">
             <button className="secondary" onClick={exportData} disabled={busy}>
@@ -2079,9 +2205,9 @@ function SettingsPage({
                 setBusy(true);
                 try {
                   const payload = JSON.parse(await input.text());
-                  await restore(payload);
-                  setState(payload.state);
-                  if (pushToken()) await syncPush(payload.state.reminders);
+                  const restored = await replaceData(payload);
+                  setState(restored);
+                  if (pushToken()) await syncPush();
                   notify("Данные восстановлены");
                   setInput(null);
                 } catch (e) {

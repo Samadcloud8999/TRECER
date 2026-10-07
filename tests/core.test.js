@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { localStamp, asUTC, totals, dueReminder } from "../src/core.js";
-import { nextDue, cleanReminders } from "../server/push.js";
 test("Bishkek date crosses UTC day boundary", () =>
   assert.equal(
     localStamp(new Date("2026-10-05T20:00:00Z")),
@@ -39,28 +38,17 @@ test("local event fires at Bishkek time only once", () => {
     null,
   );
 });
-test("daily recurrence chooses tomorrow after due time", () => {
+test("daily reminder becomes due again on the next Bishkek day", () => {
   const r = {
     enabled: true,
     repeat: "daily",
     date: "2026-10-06",
     time: "21:00",
+    fired: "2026-10-06",
   };
+  assert.equal(dueReminder(r, new Date("2026-10-06T16:00:00Z")), null);
   assert.equal(
-    nextDue(r, asUTC("2026-10-06T22:00")),
-    asUTC("2026-10-07T21:00"),
+    dueReminder(r, new Date("2026-10-07T15:00:00Z")).key,
+    "2026-10-07",
   );
-  assert.equal(nextDue({ ...r, enabled: false }), null);
 });
-test("server rejects malformed reminders", () =>
-  assert.throws(() =>
-    cleanReminders([
-      {
-        id: "a",
-        title: "a",
-        time: "27:10",
-        repeat: "daily",
-        date: "2026-10-06",
-      },
-    ]),
-  ));

@@ -76,6 +76,11 @@ assert.equal(
   (await readData()).records.find((r) => r.kind === "saving").amount,
   500,
 );
+await user.click(screen.getByRole("link", { name: "Друзья" }));
+await screen.findByRole("heading", { name: "Подключи облачный аккаунт" });
+await user.click(screen.getByRole("link", { name: "Аккаунт" }));
+await screen.findByRole("heading", { name: "Google-вход пока не настроен" });
 cleanup();
+console.log("PASS: account and friends setup states");
 console.log("PASS: decimal input, edit, savings, persisted reload");
 process.exit(0);

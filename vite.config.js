@@ -6,6 +6,7 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks(id) {
+          if (id.includes("/node_modules/@supabase/")) return "cloud";
           if (id.includes("/node_modules/three/")) return "three";
           if (id.includes("/node_modules/leaflet/")) return "maps";
           if (/node_modules\/(recharts|d3-|victory)/.test(id)) return "charts";

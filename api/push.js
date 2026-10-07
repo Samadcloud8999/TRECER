@@ -1,85 +1,71 @@
 import {
-  ready,
-  redis,
-  deviceKey,
-  cleanReminders,
-  schedule,
-} from "../server/push.js";
+  database,
+  check,
+  authenticate,
+  sameOrigin,
+  body,
+  limit,
+} from "../server/cloud.js";
+import { pushReady, validEndpoint } from "../server/delivery.js";
 export default async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
-  if (!ready())
-    return res.status(503).json({ error: "Push server not configured" });
-  if (req.method === "GET" && req.query.action === "key")
+  if (req.method === "GET" && req.query.action === "key") {
+    if (!pushReady())
+      return res.status(503).json({ error: "Настрой VAPID-ключи на Vercel" });
     return res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
-  if (!["POST", "PUT", "DELETE"].includes(req.method))
+  }
+  if (!["POST", "DELETE", "PUT"].includes(req.method))
     return res.status(405).end();
-  const origin = req.headers.origin;
-  const host = req.headers.host;
-  if (origin && new URL(origin).host !== host)
-    return res.status(403).json({ error: "Invalid origin" });
+  if (!sameOrigin(req))
+    return res.status(403).json({ error: "Недопустимый источник" });
   try {
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-    if (
-      !body ||
-      typeof body.token !== "string" ||
-      !/^[a-zA-Z0-9-]{60,100}$/.test(body.token)
-    )
-      return res.status(400).json({ error: "Invalid device token" });
-    const key = deviceKey(body.token);
-    const previous = JSON.parse((await redis("GET", key)) || "null");
+    const { db, user } = await authenticate(req);
+    const data = body(req);
+    if (req.method === "PUT") return res.json({ ok: true });
     if (req.method === "DELETE") {
-      if (previous) {
-        for (const r of previous.reminders)
-          await redis("ZREM", "karman:queue", key + ":" + r.id);
-        await redis("DEL", key);
-      }
+      let query = db
+        .from("push_subscriptions")
+        .delete()
+        .eq("owner_id", user.id);
+      if (data.endpoint) query = query.eq("endpoint", data.endpoint);
+      else if (!data.allDevice)
+        return res.status(400).json({ error: "Укажи устройство" });
+      check(await query);
       return res.json({ ok: true });
     }
-    const reminders = cleanReminders(body.reminders);
-    const subscription =
-      req.method === "POST" ? body.subscription : previous?.subscription;
-    if (!subscription)
-      return res.status(404).json({ error: "Device not registered" });
-    const endpoint = new URL(subscription.endpoint);
-    const allowed = [
-      "fcm.googleapis.com",
-      "updates.push.services.mozilla.com",
-      "web.push.apple.com",
-      "wns.windows.com",
-      "notify.windows.com",
-    ];
+    await limit(db, req, "push-register-" + user.id, 100);
+    const sub = data.subscription;
     if (
-      endpoint.protocol !== "https:" ||
-      !allowed.some(
-        (h) => endpoint.hostname === h || endpoint.hostname.endsWith("." + h),
-      ) ||
-      !subscription.keys?.p256dh ||
-      !subscription.keys?.auth
+      !validEndpoint(sub?.endpoint) ||
+      !sub?.keys?.p256dh ||
+      !sub?.keys?.auth ||
+      JSON.stringify(sub).length > 8192
     )
-      return res.status(400).json({ error: "Unsupported push endpoint" });
-    if (req.method === "POST") {
-      const bucket =
-        "karman:limit:" +
-        String(req.headers["x-forwarded-for"] || "local").split(",")[0];
-      const n = await redis("INCR", bucket);
-      if (n === 1) await redis("EXPIRE", bucket, 3600);
-      if (n > 20)
-        return res.status(429).json({ error: "Too many subscriptions" });
-    }
-    await redis(
-      "SET",
-      key,
-      JSON.stringify({ subscription, reminders }),
-      "EX",
-      31536000,
+      return res.status(400).json({ error: "Недопустимая push-подписка" });
+    const existing = check(
+      await db
+        .from("push_subscriptions")
+        .select("id,owner_id")
+        .eq("endpoint", sub.endpoint)
+        .maybeSingle(),
     );
-    if (previous)
-      for (const r of previous.reminders)
-        await redis("ZREM", "karman:queue", key + ":" + r.id);
-    await schedule(key, reminders);
+    if (existing && existing.owner_id !== user.id)
+      return res.status(409).json({
+        error: "Отключи уведомления предыдущего аккаунта на этом устройстве",
+      });
+    check(
+      await db.from("push_subscriptions").upsert(
+        {
+          ...(existing ? { id: existing.id } : {}),
+          owner_id: user.id,
+          endpoint: sub.endpoint,
+          subscription: sub,
+        },
+        { onConflict: "endpoint" },
+      ),
+    );
     return res.json({ ok: true });
   } catch (e) {
-    console.error("Push update failed", e.message);
-    return res.status(400).json({ error: "Unable to update push settings" });
+    return res.status(400).json({ error: e.message });
   }
 }
